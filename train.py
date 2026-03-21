@@ -32,10 +32,11 @@ from torch.utils.data import Dataset, DataLoader
 from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 
-from model import (
-    PrismV2, PRESETS as V2_PRESETS, warp,
-    MultiScaleDiscriminator, PerceptualLoss, HingeLoss,
-)
+# V2 model: U-Net + Transformer (12.4ms at 1080p with cooperative vectors)
+from model import PrismV2, PRESETS as V2_PRESETS, warp
+# V1 discriminator + losses (still used for GAN training)
+from model import MultiScaleDiscriminator, PerceptualLoss, HingeLoss
+# Game-style augmentation (applied to real video input so model learns color correction)
 from augment_gpu import game_augment_gpu
 
 
@@ -349,8 +350,10 @@ class Trainer:
         else:
             self.amp_dtype = torch.float32
 
-        # GradScaler only needed for FP16, not BF16 or FP8
+        # GradScaler for FP16 stability. For BF16: scaler is disabled but we still
+        # use gradient clipping (critical for transformer stability)
         use_scaler = self.use_amp and self.amp_dtype == torch.float16 and not use_fp8
+        # Always enable scaler wrapper (disabled scalers are no-ops but let us use same code path)
         self.scaler_G = GradScaler("cuda", enabled=use_scaler)
         self.scaler_D = GradScaler("cuda", enabled=use_scaler)
 
@@ -455,14 +458,20 @@ class Trainer:
                 prev_output = None
                 prev_hidden = None
 
-            # Backward + step
+            # Backward + step (with GradScaler for FP16 + gradient clipping for transformer)
             self.opt_D.zero_grad()
-            d_loss.backward(retain_graph=True)
-            self.opt_D.step()
+            self.scaler_D.scale(d_loss).backward(retain_graph=True)
+            self.scaler_D.unscale_(self.opt_D)
+            torch.nn.utils.clip_grad_norm_(self.D.parameters(), 1.0)
+            self.scaler_D.step(self.opt_D)
+            self.scaler_D.update()
 
             self.opt_G.zero_grad()
-            g_loss.backward()
-            self.opt_G.step()
+            self.scaler_G.scale(g_loss).backward()
+            self.scaler_G.unscale_(self.opt_G)
+            torch.nn.utils.clip_grad_norm_(self.G.parameters(), 1.0)
+            self.scaler_G.step(self.opt_G)
+            self.scaler_G.update()
 
             B = color.shape[0]
             totals["g"] += g_loss.item() * B
