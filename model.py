@@ -233,11 +233,16 @@ class PrismV2(nn.Module):
         self.dec2 = UpBlock(dec[0], enc[1], dec[1])              # ×2: 270×480
         self.dec1 = UpBlock(dec[1], enc[0], dec[2])              # ×2: 540×960
 
-        # Output: PixelShuffle to display res
-        scale = cfg.scale
-        self.to_rgb = nn.Sequential(
-            nn.Conv2d(dec[2], 3 * scale * scale, 3, padding=1),
-            nn.PixelShuffle(scale),
+        # Output: dual PixelShuffle paths (2x and 3x)
+        # Only ONE runs per frame — zero wasted compute
+        self.to_rgb_2x = nn.Sequential(
+            nn.Conv2d(dec[2], 3 * 4, 3, padding=1),   # 32 -> 12ch
+            nn.PixelShuffle(2),
+            nn.Sigmoid(),
+        )
+        self.to_rgb_3x = nn.Sequential(
+            nn.Conv2d(dec[2], 3 * 9, 3, padding=1),   # 32 -> 27ch
+            nn.PixelShuffle(3),
             nn.Sigmoid(),
         )
 
@@ -284,8 +289,12 @@ class PrismV2(nn.Module):
         d1 = self.dec2(d2, e1)            # 270×480, 64ch
         d0 = self.dec1(d1, e0)            # 540×960, 32ch
 
-        # Output
-        output = self.to_rgb(d0)          # 1080×1920, 3ch
+        # Output — pick PixelShuffle path based on target scale
+        scale = max(target_h / rH, target_w / rW)
+        if scale <= 2.0:
+            output = self.to_rgb_2x(d0)
+        else:
+            output = self.to_rgb_3x(d0)
 
         if output.shape[2] != target_h or output.shape[3] != target_w:
             output = F.interpolate(output, (target_h, target_w), mode="bilinear", align_corners=False)
@@ -363,10 +372,7 @@ class PatchDiscriminator(nn.Module):
             ch = ch_next
         layers.append(nn.Conv2d(ch, 1, 4, 1, 1))
         self.model = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.model(x)
-
+    def forward(self, x): return self.model(x)
 
 class MultiScaleDiscriminator(nn.Module):
     def __init__(self, in_ch: int = 3):
@@ -374,14 +380,7 @@ class MultiScaleDiscriminator(nn.Module):
         self.disc1 = PatchDiscriminator(in_ch)
         self.disc2 = PatchDiscriminator(in_ch)
         self.down = nn.AvgPool2d(3, 2, 1)
-
-    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
-        return [self.disc1(x), self.disc2(self.down(x))]
-
-
-# ============================================================================
-# Losses
-# ============================================================================
+    def forward(self, x): return [self.disc1(x), self.disc2(self.down(x))]
 
 class PerceptualLoss(nn.Module):
     def __init__(self):
@@ -389,10 +388,8 @@ class PerceptualLoss(nn.Module):
         from torchvision.models import vgg16, VGG16_Weights
         vgg = vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features
         self.blocks = nn.ModuleList([vgg[:4], vgg[4:9], vgg[9:16]])
-        for p in self.parameters():
-            p.requires_grad = False
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        for p in self.parameters(): p.requires_grad = False
+    def forward(self, pred, target):
         loss = torch.tensor(0.0, device=pred.device)
         x, y = pred, target
         for block in self.blocks:
@@ -400,13 +397,10 @@ class PerceptualLoss(nn.Module):
             loss = loss + F.l1_loss(x, y)
         return loss
 
-
 class HingeLoss:
     @staticmethod
-    def d_loss(real_preds: list, fake_preds: list) -> torch.Tensor:
-        return sum(F.relu(1 - r).mean() + F.relu(1 + f).mean()
-                   for r, f in zip(real_preds, fake_preds)) / len(real_preds)
-
+    def d_loss(real_preds, fake_preds):
+        return sum(F.relu(1 - r).mean() + F.relu(1 + f).mean() for r, f in zip(real_preds, fake_preds)) / len(real_preds)
     @staticmethod
-    def g_loss(fake_preds: list) -> torch.Tensor:
+    def g_loss(fake_preds):
         return sum(-f.mean() for f in fake_preds) / len(fake_preds)
