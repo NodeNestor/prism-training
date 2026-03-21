@@ -9,7 +9,7 @@ Sources:
 These get is_real=False so the discriminator learns to distinguish game vs real.
 Except FFHQ which gets is_real=True (real faces, just from images not video).
 
-Output goes to I:/prism-dataset/dataset-v3/ starting from the next available index.
+Output appends to the dataset directory starting from the next available index.
 
 Usage:
   python generate_synthetic.py --device cuda:0
@@ -25,7 +25,7 @@ from tqdm import tqdm
 
 CROP_IN = 256
 CROPS_PER_FRAME = 4
-RAW_DIR = Path("I:/prism-dataset/raw")
+RAW_DIR = Path(os.environ.get("PRISM_RAW_DIR", "data/raw"))
 
 
 def save_sample_uint8(sample, path):
@@ -96,7 +96,7 @@ def process_tartanair(output_dir, start_idx, target, device):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--output", default="I:/prism-dataset/dataset-v3")
+    parser.add_argument("--output", default="data/dataset")
     parser.add_argument("--target-synthetic", type=int, default=45000,
                         help="Target synthetic samples (to match ~88K real)")
     parser.add_argument("--target-faces", type=int, default=10000)

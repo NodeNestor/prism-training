@@ -39,7 +39,7 @@ SOURCES = {
     "game-screenshots-8k": (10000, 1, False),
 }
 
-RAW_DIR = Path("I:/prism-dataset/raw")
+RAW_DIR = Path(os.environ.get("PRISM_RAW_DIR", "data/raw"))
 CROP_IN = 256
 CROPS_PER_FRAME = 4  # random crops per extracted frame
 
@@ -89,7 +89,7 @@ def save_sample_uint8(sample, path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--output", default="E:/prism-v3-train")
+    parser.add_argument("--output", default="data/dataset")
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--source", type=str, default=None, help="Process only this source")
     args = parser.parse_args()
