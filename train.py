@@ -442,6 +442,9 @@ class Trainer:
             with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.use_amp or self.use_fp8):
                 g_fake_preds = self.D(fake)
                 l1 = F.l1_loss(fake, gt)
+                # Perceptual loss on subset to save VRAM (8 samples max)
+                perc_n = min(8, fake.shape[0])
+                perc = self.perceptual(fake[:perc_n].float(), gt[:perc_n].float())
                 adv = self.gan_loss.g_loss(g_fake_preds)
 
                 # Temporal consistency loss
@@ -455,7 +458,7 @@ class Trainer:
                 else:
                     temp_loss = torch.tensor(0.0, device=self.device)
 
-                g_loss = l1 + adv_weight * adv + temporal_weight * temp_loss
+                g_loss = l1 + 0.5 * perc + adv_weight * adv + temporal_weight * temp_loss
 
             # Update hidden state (detached — no BPTT, just streaming)
             prev_output = fake.detach()
@@ -478,7 +481,7 @@ class Trainer:
             totals["g"] += g_loss.item() * B
             totals["d"] += d_loss.item() * B
             totals["l1"] += l1.item() * B
-            totals["perc"] += 0.0
+            totals["perc"] += perc.item() * B
             totals["adv"] += adv.item() * B
             totals["temp"] += temp_loss.item() * B
             totals["n"] += B
@@ -780,7 +783,7 @@ def main():
         try:
             for epoch in range(phase_epochs):
                 total_epoch = total_epochs_done + epoch
-                adv_w = min(0.01, 0.01 * min(1.0, total_epoch / max(args.adv_warmup, 1)))
+                adv_w = min(0.03, 0.03 * min(1.0, total_epoch / max(args.adv_warmup, 1)))
 
                 t0 = time.time()
                 m = trainer.train_epoch(loader, adv_weight=adv_w, d_every=args.d_every)
@@ -792,9 +795,8 @@ def main():
                 if (total_epoch + 1) % args.save_every == 0:
                     trainer.save(args.output)
 
-                # Generate test comparison images every 5 epochs
-                if (total_epoch + 1) % 5 == 0:
-                    trainer._save_test_images(loader, total_epoch + 1)
+                # Generate test comparison images every epoch
+                trainer._save_test_images(loader, total_epoch + 1)
         except KeyboardInterrupt:
             print("\nInterrupted")
             break
