@@ -238,12 +238,10 @@ class PrismV2(nn.Module):
         self.to_rgb_2x = nn.Sequential(
             nn.Conv2d(dec[2], 3 * 4, 3, padding=1),   # 32 -> 12ch
             nn.PixelShuffle(2),
-            nn.Sigmoid(),
         )
         self.to_rgb_3x = nn.Sequential(
             nn.Conv2d(dec[2], 3 * 9, 3, padding=1),   # 32 -> 27ch
             nn.PixelShuffle(3),
-            nn.Sigmoid(),
         )
 
     def forward(self, color, depth, motion_vectors,
@@ -295,6 +293,9 @@ class PrismV2(nn.Module):
             output = self.to_rgb_2x(d0)
         else:
             output = self.to_rgb_3x(d0)
+
+        # Sigmoid in float32 to prevent channel death in bf16
+        output = output.float().sigmoid().to(d0.dtype)
 
         if output.shape[2] != target_h or output.shape[3] != target_w:
             output = F.interpolate(output, (target_h, target_w), mode="bilinear", align_corners=False)
@@ -364,13 +365,14 @@ if __name__ == "__main__":
 class PatchDiscriminator(nn.Module):
     def __init__(self, in_ch: int = 3, ndf: int = 64, n_layers: int = 3):
         super().__init__()
-        layers = [nn.Conv2d(in_ch, ndf, 4, 2, 1), nn.LeakyReLU(0.2, True)]
+        sn = nn.utils.spectral_norm
+        layers = [sn(nn.Conv2d(in_ch, ndf, 4, 2, 1)), nn.LeakyReLU(0.2, False)]
         ch = ndf
         for i in range(1, n_layers):
             ch_next = min(ndf * 2 ** i, ndf * 8)
-            layers += [nn.Conv2d(ch, ch_next, 4, 2, 1), nn.LeakyReLU(0.2, True)]
+            layers += [sn(nn.Conv2d(ch, ch_next, 4, 2, 1)), nn.LeakyReLU(0.2, False)]
             ch = ch_next
-        layers.append(nn.Conv2d(ch, 1, 4, 1, 1))
+        layers.append(sn(nn.Conv2d(ch, 1, 4, 1, 1)))
         self.model = nn.Sequential(*layers)
     def forward(self, x): return self.model(x)
 
