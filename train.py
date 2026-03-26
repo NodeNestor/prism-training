@@ -22,6 +22,7 @@ Usage:
 """
 
 import argparse
+import os
 import time
 from pathlib import Path
 
@@ -415,8 +416,9 @@ class Trainer:
                 if gt.shape != fake.shape:
                     gt = F.interpolate(gt, fake.shape[2:], mode="bilinear", align_corners=False)
 
-                # D forward
-                fake_preds = self.D(fake)
+                # --- D step: uses fake.detach() so no graph shared with G ---
+                fake_det = fake.detach()
+                d_fake_preds = self.D(fake_det)
 
                 if is_real.any():
                     real_gt = gt[is_real]
@@ -424,22 +426,32 @@ class Trainer:
                 else:
                     real_preds = None
 
-                # D loss
-                fake_preds_detached = [fp.detach() for fp in fake_preds]
                 if real_preds is not None:
-                    d_loss = self.gan_loss.d_loss(real_preds, fake_preds_detached)
+                    d_loss = self.gan_loss.d_loss(real_preds, d_fake_preds)
                 else:
-                    d_loss = F.relu(1 + fake_preds_detached[0]).mean()
+                    d_loss = F.relu(1 + d_fake_preds[0]).mean()
 
-                # G loss
+            # D backward + step (separate graph, no retain needed)
+            self.opt_D.zero_grad()
+            self.scaler_D.scale(d_loss).backward()
+            self.scaler_D.unscale_(self.opt_D)
+            torch.nn.utils.clip_grad_norm_(self.D.parameters(), 1.0)
+            self.scaler_D.step(self.opt_D)
+            self.scaler_D.update()
+
+            # --- G step: own D forward so gradients flow through G ---
+            with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.use_amp or self.use_fp8):
+                g_fake_preds = self.D(fake)
                 l1 = F.l1_loss(fake, gt)
-                adv = self.gan_loss.g_loss(fake_preds)
+                # Perceptual loss on subset to save VRAM (8 samples max)
+                perc_n = min(8, fake.shape[0])
+                perc = self.perceptual(fake[:perc_n].float(), gt[:perc_n].float())
+                adv = self.gan_loss.g_loss(g_fake_preds)
 
                 # Temporal consistency loss
                 if prev_output is not None:
                     warped_prev = warp(prev_output, F.interpolate(mv, prev_output.shape[2:],
                                        mode="bilinear", align_corners=False))
-                    # Resize if scale changed between batches
                     if warped_prev.shape != fake.shape:
                         warped_prev = F.interpolate(warped_prev, fake.shape[2:],
                                                      mode="bilinear", align_corners=False)
@@ -447,7 +459,7 @@ class Trainer:
                 else:
                     temp_loss = torch.tensor(0.0, device=self.device)
 
-                g_loss = l1 + adv_weight * adv + temporal_weight * temp_loss
+                g_loss = l1 + 0.5 * perc + adv_weight * adv + temporal_weight * temp_loss
 
             # Update hidden state (detached — no BPTT, just streaming)
             prev_output = fake.detach()
@@ -458,14 +470,7 @@ class Trainer:
                 prev_output = None
                 prev_hidden = None
 
-            # Backward + step (with GradScaler for FP16 + gradient clipping for transformer)
-            self.opt_D.zero_grad()
-            self.scaler_D.scale(d_loss).backward(retain_graph=True)
-            self.scaler_D.unscale_(self.opt_D)
-            torch.nn.utils.clip_grad_norm_(self.D.parameters(), 1.0)
-            self.scaler_D.step(self.opt_D)
-            self.scaler_D.update()
-
+            # G backward + step
             self.opt_G.zero_grad()
             self.scaler_G.scale(g_loss).backward()
             self.scaler_G.unscale_(self.opt_G)
@@ -477,7 +482,7 @@ class Trainer:
             totals["g"] += g_loss.item() * B
             totals["d"] += d_loss.item() * B
             totals["l1"] += l1.item() * B
-            totals["perc"] += 0.0
+            totals["perc"] += perc.item() * B
             totals["adv"] += adv.item() * B
             totals["temp"] += temp_loss.item() * B
             totals["n"] += B
@@ -527,7 +532,7 @@ class Trainer:
             _, _, dH, dW = gt.shape
 
             def to_np(t):
-                return (t[0].cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                return (t[0].cpu().float().clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
             images = {}
 
@@ -591,12 +596,73 @@ class Trainer:
         torch.save(self.G.state_dict(), path / "prism_generator_latest.pth")
         print(f"Saved epoch {self.epoch}")
 
+    @torch.no_grad()
+    def _save_test_images(self, loader, epoch_num):
+        """Save comparison images for browser viewing."""
+        import numpy as np
+        from PIL import Image as PILImage
+
+        output_dir = Path(os.environ.get("PRISM_TEST_OUTPUT", "test_outputs"))
+        output_dir.mkdir(exist_ok=True)
+
+        self.G.eval()
+        try:
+            # Grab 5 samples from separate sequences (skip batches between)
+            samples = []
+            skip = 0
+            for seq in loader:
+                skip += 1
+                if skip % 20 == 0:  # every 20th batch = different sequence
+                    samples.append(seq[0])
+                if len(samples) >= 5:
+                    break
+
+            def to_np(t):
+                return (t[0].cpu().float().clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+
+            for i, frame in enumerate(samples):
+                c = frame["color"][:1].to(self.device).float()
+                d = frame["depth"][:1].to(self.device).float()
+                mv = frame["motion_vectors"][:1].to(self.device).float()
+                gt = frame["ground_truth"][:1].to(self.device).float()
+                _, _, rH, rW = c.shape
+
+                for scale, label in [(2, "2x"), (3, "3x")]:
+                    tH, tW = rH * scale, rW * scale
+                    with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+                        out, _ = self.G(c, d, mv, target_h=tH, target_w=tW)
+                    gt_r = F.interpolate(gt, (tH, tW), mode="bilinear", align_corners=False)
+                    nearest = F.interpolate(c, (tH, tW), mode="nearest")
+                    bilinear = F.interpolate(c, (tH, tW), mode="bilinear", align_corners=False)
+                    comp = torch.cat([nearest, bilinear, out, gt_r], dim=3)
+                    img = PILImage.fromarray(to_np(comp))
+                    img.save(output_dir / f"ep{epoch_num:03d}_sample{i}_{label}.png")
+
+            # Update index.html
+            html = f'<html><head><meta http-equiv="refresh" content="60"><style>body{{background:#111;color:#fff;font-family:monospace}}img{{max-width:100%;margin:5px 0}}</style></head><body>'
+            html += f'<h1>Prism Training — Epoch {epoch_num}</h1><p>Nearest | Bilinear | Prism | Ground Truth</p>'
+            for f in sorted(output_dir.glob("ep*.png"), reverse=True):
+                html += f'<h3>{f.name}</h3><img src="{f.name}"><br>'
+            html += "</body></html>"
+            (output_dir / "index.html").write_text(html)
+            print(f"  [test images saved to {output_dir}]")
+        except Exception as e:
+            print(f"  [test image save failed: {e}]")
+        finally:
+            self.G.train()
+
     def load(self, path: Path):
         ckpt = torch.load(path, map_location=self.device, weights_only=True)
         self.G.load_state_dict(ckpt["generator"])
-        self.D.load_state_dict(ckpt["discriminator"])
-        self.opt_G.load_state_dict(ckpt["opt_G"])
-        self.opt_D.load_state_dict(ckpt["opt_D"])
+        try:
+            self.D.load_state_dict(ckpt["discriminator"])
+            self.opt_D.load_state_dict(ckpt["opt_D"])
+        except RuntimeError:
+            print("  D weights incompatible (likely spectral norm change), using fresh D")
+        try:
+            self.opt_G.load_state_dict(ckpt["opt_G"])
+        except Exception:
+            print("  G optimizer state incompatible, using fresh optimizer")
         self.epoch = ckpt["epoch"]
         print(f"Resumed from epoch {self.epoch}")
 
@@ -629,6 +695,11 @@ class Trainer:
 # ============================================================================
 
 def main():
+    # GPU optimizations: TF32 for convolutions (when available), cudnn autotuning
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+
     parser = argparse.ArgumentParser(description="Train Prism G-buffer decoder")
     parser.add_argument("--data", type=Path, default=Path("data/dataset"))
     parser.add_argument("--output", type=Path, default=Path("checkpoints"))
@@ -713,7 +784,7 @@ def main():
         try:
             for epoch in range(phase_epochs):
                 total_epoch = total_epochs_done + epoch
-                adv_w = 0.1 + 0.4 * min(1.0, total_epoch / max(args.adv_warmup, 1))
+                adv_w = min(0.03, 0.03 * min(1.0, total_epoch / max(args.adv_warmup, 1)))
 
                 t0 = time.time()
                 m = trainer.train_epoch(loader, adv_weight=adv_w, d_every=args.d_every)
@@ -724,6 +795,9 @@ def main():
 
                 if (total_epoch + 1) % args.save_every == 0:
                     trainer.save(args.output)
+
+                # Generate test comparison images every epoch
+                trainer._save_test_images(loader, total_epoch + 1)
         except KeyboardInterrupt:
             print("\nInterrupted")
             break
