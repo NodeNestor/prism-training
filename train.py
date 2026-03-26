@@ -34,7 +34,7 @@ from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 
 # V2 model: U-Net + Transformer (12.4ms at 1080p with cooperative vectors)
-from model import PrismV2, PRESETS as V2_PRESETS, warp
+from model import PrismV2, ModelConfig, PRESETS as V2_PRESETS, warp
 # V1 discriminator + losses (still used for GAN training)
 from model import MultiScaleDiscriminator, PerceptualLoss, HingeLoss
 # Game-style augmentation (applied to real video input so model learns color correction)
@@ -290,6 +290,7 @@ class Trainer:
     def __init__(
         self,
         model_name: str = "balanced",
+        model_config=None,
         optimizer_name: str = "adamw",
         lr_g: float = 1e-4,
         lr_d: float = 4e-4,
@@ -310,11 +311,14 @@ class Trainer:
             gpu_cc = torch.cuda.get_device_capability(self.device)
             print(f"Device: {gpu_name} ({gpu_mem:.0f}GB, compute {gpu_cc[0]}.{gpu_cc[1]})")
 
-        # Models — V2 architecture (U-Net + Transformer)
-        if model_name in V2_PRESETS:
-            self.G = PrismV2(V2_PRESETS[model_name]).to(self.device)
+        # Models — V2 architecture (U-Net + Transformer, optionally with MoE)
+        if model_config is not None:
+            cfg = model_config
+        elif model_name in V2_PRESETS:
+            cfg = V2_PRESETS[model_name]
         else:
             raise ValueError(f"Unknown model: {model_name}. Available: {list(V2_PRESETS.keys())}")
+        self.G = PrismV2(cfg).to(self.device)
         self.D = MultiScaleDiscriminator().to(self.device)
         self.perceptual = PerceptualLoss().to(self.device)
 
@@ -366,11 +370,15 @@ class Trainer:
 
         self.use_wandb = use_wandb
         if use_wandb:
+            from dataclasses import asdict
             import wandb
+            G_inner = self.G.module if hasattr(self.G, 'module') else self.G
             wandb.init(project="prism", config={
                 "model": model_name, "optimizer": optimizer_name,
                 "lr_g": lr_g, "lr_d": lr_d, "fp8": use_fp8, "amp": use_amp,
                 "device": str(device),
+                "g_params": sum(p.numel() for p in self.G.parameters()),
+                **{f"model/{k}": v for k, v in asdict(G_inner.cfg).items()},
             })
 
     def train_epoch(self, loader: DataLoader, adv_weight: float = 0.1,
@@ -384,7 +392,7 @@ class Trainer:
         self.G.train()
         self.D.train()
 
-        totals = {"g": 0, "d": 0, "l1": 0, "perc": 0, "adv": 0, "temp": 0, "n": 0}
+        totals = {"g": 0, "d": 0, "l1": 0, "perc": 0, "adv": 0, "temp": 0, "moe": 0, "moe_bal": 0, "n": 0}
 
         # Persistent hidden state across steps (streaming)
         prev_output = None
@@ -459,7 +467,18 @@ class Trainer:
                 else:
                     temp_loss = torch.tensor(0.0, device=self.device)
 
-                g_loss = l1 + 0.5 * perc + adv_weight * adv + temporal_weight * temp_loss
+                # MoE auxiliary losses (balance + z-loss for router stability)
+                G_inner = self.G.module if hasattr(self.G, 'module') else self.G
+                if G_inner.cfg.n_experts > 0:
+                    moe_balance = G_inner._moe_balance_loss
+                    moe_z = G_inner._moe_z_loss
+                    moe_w = G_inner.cfg.moe_balance_weight
+                    moe_loss = moe_w * moe_balance + 0.001 * moe_z
+                else:
+                    moe_loss = torch.tensor(0.0, device=self.device)
+                    moe_balance = torch.tensor(0.0, device=self.device)
+
+                g_loss = l1 + 0.5 * perc + adv_weight * adv + temporal_weight * temp_loss + moe_loss
 
             # Update hidden state (detached — no BPTT, just streaming)
             prev_output = fake.detach()
@@ -485,21 +504,82 @@ class Trainer:
             totals["perc"] += perc.item() * B
             totals["adv"] += adv.item() * B
             totals["temp"] += temp_loss.item() * B
+            totals["moe"] += moe_loss.item() * B
+            totals["moe_bal"] += moe_balance.item() * B
             totals["n"] += B
 
         n = max(totals["n"], 1)
         self.epoch += 1
-        metrics = {k: totals[k] / n for k in ["g", "d", "l1", "perc", "adv", "temp"]}
+        metrics = {k: totals[k] / n for k in ["g", "d", "l1", "perc", "adv", "temp", "moe", "moe_bal"]}
 
         if self.use_wandb:
             import wandb
-            wandb.log(metrics, step=self.epoch)
+            log_data = dict(metrics)
+
+            # MoE expert usage stats
+            G_inner = self.G.module if hasattr(self.G, 'module') else self.G
+            if G_inner.cfg.n_experts > 0 and hasattr(G_inner, '_moe_expert_usage') and G_inner._moe_expert_usage:
+                import numpy as np
+                # Average expert usage across all blocks
+                all_usage = torch.stack(G_inner._moe_expert_usage)  # (n_blocks, n_experts)
+                avg_usage = all_usage.mean(dim=0).cpu().numpy()  # (n_experts,)
+                n_experts = len(avg_usage)
+                uniform = 1.0 / n_experts
+
+                # Key health metrics
+                log_data["moe/expert_usage_std"] = float(avg_usage.std())
+                log_data["moe/expert_usage_max"] = float(avg_usage.max())
+                log_data["moe/expert_usage_min"] = float(avg_usage.min())
+                log_data["moe/max_min_ratio"] = float(avg_usage.max() / max(avg_usage.min(), 1e-8))
+                log_data["moe/dead_experts"] = int((avg_usage < uniform * 0.1).sum())
+                log_data["moe/balance_loss"] = metrics["moe_bal"]
+
+                # Per-expert usage histogram
+                log_data["moe/expert_usage"] = wandb.Histogram(avg_usage)
+
+                # Per-block heatmap (every 10 epochs to avoid log spam)
+                if self.epoch % 10 == 0:
+                    usage_grid = all_usage.cpu().numpy()
+                    log_data["moe/block_expert_heatmap"] = wandb.Image(
+                        self._make_usage_heatmap(usage_grid, n_experts),
+                        caption=f"Expert usage by block (epoch {self.epoch})"
+                    )
+
+            wandb.log(log_data, step=self.epoch)
 
             # Log sample images every 5 epochs
             if self.epoch % 5 == 0:
                 self._log_sample_images()
 
         return metrics
+
+    @staticmethod
+    def _make_usage_heatmap(usage_grid, n_experts):
+        """Create a simple heatmap image of expert usage per block."""
+        import numpy as np
+        from PIL import Image as PILImage
+        # usage_grid: (n_blocks, n_experts)
+        n_blocks = usage_grid.shape[0]
+        uniform = 1.0 / n_experts
+        # Normalize: 0 = no usage, 1 = uniform, >1 = overloaded
+        normalized = usage_grid / uniform
+        # Clamp to [0, 3] for visualization
+        normalized = np.clip(normalized, 0, 3) / 3.0
+        # Scale up for visibility
+        cell_h, cell_w = 12, max(4, 200 // n_experts)
+        img = np.zeros((n_blocks * cell_h, n_experts * cell_w, 3), dtype=np.uint8)
+        for b in range(n_blocks):
+            for e in range(n_experts):
+                v = normalized[b, e]
+                # Green = balanced, Red = overloaded, Blue = underused
+                if v < 0.33:
+                    r, g, bl = int(50 * v * 3), int(50 * v * 3), int(200 * (1 - v * 3))
+                elif v < 0.5:
+                    r, g, bl = 0, int(200 * (v - 0.33) * 6), 0
+                else:
+                    r, g, bl = int(200 * (v - 0.5) * 2), int(200 * (1 - (v - 0.5) * 2)), 0
+                img[b*cell_h:(b+1)*cell_h, e*cell_w:(e+1)*cell_w] = [r, g, bl]
+        return PILImage.fromarray(img)
 
     def set_fixed_sample(self, loader):
         """Grab a fixed sample from the dataset for consistent wandb image logging."""
@@ -585,15 +665,18 @@ class Trainer:
             self.G.train()
 
     def save(self, path: Path):
+        from dataclasses import asdict
         path.mkdir(parents=True, exist_ok=True)
+        G_inner = self.G.module if hasattr(self.G, 'module') else self.G
         torch.save({
-            "generator": self.G.state_dict(),
+            "generator": G_inner.state_dict(),
             "discriminator": self.D.state_dict(),
             "opt_G": self.opt_G.state_dict(),
             "opt_D": self.opt_D.state_dict(),
             "epoch": self.epoch,
+            "model_config": asdict(G_inner.cfg),
         }, path / f"checkpoint_ep{self.epoch}.pth")
-        torch.save(self.G.state_dict(), path / "prism_generator_latest.pth")
+        torch.save(G_inner.state_dict(), path / "prism_generator_latest.pth")
         print(f"Saved epoch {self.epoch}")
 
     @torch.no_grad()
@@ -653,7 +736,13 @@ class Trainer:
 
     def load(self, path: Path):
         ckpt = torch.load(path, map_location=self.device, weights_only=True)
-        self.G.load_state_dict(ckpt["generator"])
+        # Try strict load first, fall back to partial
+        try:
+            self.G.load_state_dict(ckpt["generator"])
+            print("  Generator: loaded all weights (exact match)")
+        except RuntimeError:
+            # Architecture changed — load what we can
+            self._load_partial(self.G, ckpt["generator"], "Generator")
         try:
             self.D.load_state_dict(ckpt["discriminator"])
             self.opt_D.load_state_dict(ckpt["opt_D"])
@@ -665,6 +754,46 @@ class Trainer:
             print("  G optimizer state incompatible, using fresh optimizer")
         self.epoch = ckpt["epoch"]
         print(f"Resumed from epoch {self.epoch}")
+
+    def load_conv_weights(self, path: Path):
+        """Load encoder/decoder/output conv weights from a pretrained checkpoint.
+        Transformer and MoE layers are initialized fresh. This lets you upgrade
+        from a dense model to MoE while keeping trained conv layers."""
+        ckpt = torch.load(path, map_location=self.device, weights_only=True)
+        src = ckpt["generator"] if "generator" in ckpt else ckpt
+
+        # Match conv layers: input_conv, enc*, dec*, to_rgb*, temporal
+        conv_prefixes = ("input_conv.", "enc1.", "enc2.", "enc3.",
+                         "dec1.", "dec2.", "dec3.",
+                         "to_rgb_2x.", "to_rgb_3x.", "temporal.")
+        loaded, skipped = 0, 0
+        model_state = self.G.state_dict()
+        for key, val in src.items():
+            if any(key.startswith(p) for p in conv_prefixes):
+                if key in model_state and model_state[key].shape == val.shape:
+                    model_state[key] = val
+                    loaded += 1
+                else:
+                    skipped += 1
+                    if key in model_state:
+                        print(f"  Shape mismatch {key}: ckpt={val.shape} vs model={model_state[key].shape}")
+        self.G.load_state_dict(model_state)
+        print(f"  Conv weights: loaded {loaded}, skipped {skipped}")
+        print(f"  Transformer/MoE layers: initialized fresh")
+
+    @staticmethod
+    def _load_partial(model, state_dict, name="Model"):
+        """Load matching weights, skip mismatched ones."""
+        model_state = model.state_dict()
+        loaded, skipped = 0, 0
+        for key, val in state_dict.items():
+            if key in model_state and model_state[key].shape == val.shape:
+                model_state[key] = val
+                loaded += 1
+            else:
+                skipped += 1
+        model.load_state_dict(model_state)
+        print(f"  {name}: loaded {loaded}/{loaded + skipped} weights ({skipped} skipped/mismatched)")
 
     def export_onnx(self, path: Path, render_size: tuple[int, int] = (540, 960)):
         self.G.eval()
@@ -704,8 +833,16 @@ def main():
     parser.add_argument("--data", type=Path, default=Path("data/dataset"))
     parser.add_argument("--output", type=Path, default=Path("checkpoints"))
     parser.add_argument("--resume", type=Path, default=None)
-    parser.add_argument("--model", choices=["fast", "balanced", "quality"], default="balanced",
-                        help="V2 model preset: fast(590K), balanced(2.5M), quality(6.4M)")
+    parser.add_argument("--model", choices=list(V2_PRESETS.keys()), default="balanced",
+                        help="Model preset (dense: fast/balanced/quality, MoE: moe-16/moe-32/moe-64)")
+    # Override individual model config fields (applied on top of preset)
+    parser.add_argument("--n-blocks", type=int, default=None, help="Override transformer block count")
+    parser.add_argument("--n-heads", type=int, default=None, help="Override attention head count")
+    parser.add_argument("--t-dim", type=int, default=None, help="Override transformer dim (adds projection if != bottleneck)")
+    parser.add_argument("--n-experts", type=int, default=None, help="Override expert count (0=dense)")
+    parser.add_argument("--expert-hidden", type=int, default=None, help="Override per-expert FFN hidden dim")
+    parser.add_argument("--top-k", type=int, default=None, help="Override MoE top-k routing")
+    parser.add_argument("--window-size", type=int, default=None, help="Override attention window size (0=global)")
     parser.add_argument("--optimizer", choices=["adamw", "apollo-mini", "apollo"], default="apollo-mini")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch", type=int, default=4)
@@ -726,6 +863,8 @@ def main():
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--export-onnx", action="store_true")
     parser.add_argument("--d-every", type=int, default=1, help="Train D every N steps (1=every step)")
+    parser.add_argument("--resume-conv", type=Path, default=None,
+                        help="Load conv encoder/decoder weights from a pretrained checkpoint (for MoE upgrade)")
     args = parser.parse_args()
 
     # Progressive training schedule: crop size grows over epochs
@@ -757,8 +896,24 @@ def main():
         )
 
         if phase == 0:
+            # Build config from preset + CLI overrides
+            from dataclasses import replace
+            cfg = V2_PRESETS[args.model]
+            overrides = {}
+            if args.n_blocks is not None: overrides["n_transformer_blocks"] = args.n_blocks
+            if args.n_heads is not None: overrides["n_heads"] = args.n_heads
+            if args.t_dim is not None: overrides["transformer_dim"] = args.t_dim
+            if args.n_experts is not None: overrides["n_experts"] = args.n_experts
+            if args.expert_hidden is not None: overrides["expert_ffn_hidden"] = args.expert_hidden
+            if args.top_k is not None: overrides["top_k"] = args.top_k
+            if args.window_size is not None: overrides["window_size"] = args.window_size
+            if overrides:
+                cfg = replace(cfg, **overrides)
+                print(f"Config overrides: {overrides}")
+
             trainer = Trainer(
-                model_name=args.model, optimizer_name=args.optimizer,
+                model_name=args.model, model_config=cfg,
+                optimizer_name=args.optimizer,
                 lr_g=args.lr_g, lr_d=args.lr_d,
                 device=args.device, use_amp=args.amp, use_fp8=args.fp8,
                 grad_accum=args.grad_accum, use_wandb=args.wandb,
@@ -772,6 +927,8 @@ def main():
 
             if args.resume:
                 trainer.load(args.resume)
+            elif args.resume_conv:
+                trainer.load_conv_weights(args.resume_conv)
 
         # Grab a fixed sample for wandb image logging
         if args.wandb and phase == 0:
@@ -790,8 +947,9 @@ def main():
                 m = trainer.train_epoch(loader, adv_weight=adv_w, d_every=args.d_every)
                 dt = time.time() - t0
 
+                moe_str = f" moe={m['moe']:.4f}" if m['moe'] > 0 else ""
                 print(f"  [{total_epoch+1}] L1={m['l1']:.4f} adv={m['adv']:.4f}(w={adv_w:.2f}) "
-                      f"temp={m['temp']:.4f} D={m['d']:.4f} [{dt:.1f}s]")
+                      f"temp={m['temp']:.4f} D={m['d']:.4f}{moe_str} [{dt:.1f}s]")
 
                 if (total_epoch + 1) % args.save_every == 0:
                     trainer.save(args.output)
