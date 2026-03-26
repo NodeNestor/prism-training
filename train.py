@@ -22,6 +22,7 @@ Usage:
 """
 
 import argparse
+import os
 import time
 from pathlib import Path
 
@@ -597,11 +598,11 @@ class Trainer:
 
     @torch.no_grad()
     def _save_test_images(self, loader, epoch_num):
-        """Save comparison images to /home/ubuntu/prism_test_outputs for browser viewing."""
+        """Save comparison images for browser viewing."""
         import numpy as np
         from PIL import Image as PILImage
 
-        output_dir = Path("/home/ubuntu/prism_test_outputs")
+        output_dir = Path(os.environ.get("PRISM_TEST_OUTPUT", "test_outputs"))
         output_dir.mkdir(exist_ok=True)
 
         self.G.eval()
@@ -694,7 +695,7 @@ class Trainer:
 # ============================================================================
 
 def main():
-    # A100 optimizations: TF32 for convolutions, cudnn autotuning
+    # GPU optimizations: TF32 for convolutions (when available), cudnn autotuning
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
