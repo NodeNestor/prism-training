@@ -325,10 +325,11 @@ class MoEFFN(nn.Module):
             unsorted_outputs[sorted_idx] = expert_outputs
             output += unsorted_outputs * weights.unsqueeze(-1)
 
-        # Store losses and stats for training
-        self._balance_loss = balance_loss
-        self._z_loss = z_loss
-        self._expert_usage = usage
+        # Store losses and stats (training only)
+        if self.training:
+            self._balance_loss = balance_loss
+            self._z_loss = z_loss
+            self._expert_usage = usage
 
         return output.reshape(B, N, C)
 
@@ -499,19 +500,19 @@ class PrismV2(nn.Module):
         tokens = e3.flatten(2).permute(0, 2, 1)  # [B, H*W, C]
         tokens = self.proj_up(tokens)             # [B, H*W, transformer_dim]
 
-        # Collect MoE losses and stats
-        self._moe_balance_loss = torch.tensor(0.0, device=tokens.device)
-        self._moe_z_loss = torch.tensor(0.0, device=tokens.device)
-        self._moe_expert_usage = []  # per-block expert usage for logging
+        # Run transformer blocks
         spatial_shape = (H, W)
         for block in self.transformer_blocks:
             if self.use_moe:
                 tokens = block(tokens, spatial_shape=spatial_shape)
-                self._moe_balance_loss = self._moe_balance_loss + block.moe._balance_loss
-                self._moe_z_loss = self._moe_z_loss + block.moe._z_loss
-                self._moe_expert_usage.append(block.moe._expert_usage)
             else:
                 tokens = block(tokens)
+
+        # Collect MoE stats (training only — skipped during export/eval)
+        if self.use_moe and self.training:
+            self._moe_balance_loss = sum(b.moe._balance_loss for b in self.transformer_blocks)
+            self._moe_z_loss = sum(b.moe._z_loss for b in self.transformer_blocks)
+            self._moe_expert_usage = [b.moe._expert_usage for b in self.transformer_blocks]
 
         tokens = self.proj_down(tokens)           # [B, H*W, bottleneck_ch]
         e3_out = tokens.permute(0, 2, 1).reshape(B, C, H, W)
