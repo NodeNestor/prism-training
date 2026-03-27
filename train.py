@@ -795,28 +795,6 @@ class Trainer:
         model.load_state_dict(model_state)
         print(f"  {name}: loaded {loaded}/{loaded + skipped} weights ({skipped} skipped/mismatched)")
 
-    def export_onnx(self, path: Path, render_size: tuple[int, int] = (540, 960)):
-        self.G.eval()
-        rH, rW = render_size
-        dummy = (
-            torch.randn(1, 3, rH, rW, device=self.device),
-            torch.randn(1, 1, rH, rW, device=self.device),
-            torch.randn(1, 2, rH, rW, device=self.device),
-        )
-        path.parent.mkdir(parents=True, exist_ok=True)
-        torch.onnx.export(
-            self.G, dummy, str(path), opset_version=17,
-            input_names=["color", "depth", "motion_vectors"],
-            output_names=["output", "hidden"],
-            dynamic_axes={
-                "color": {0: "batch", 2: "height", 3: "width"},
-                "depth": {0: "batch", 2: "height", 3: "width"},
-                "motion_vectors": {0: "batch", 2: "height", 3: "width"},
-                "output": {0: "batch", 2: "height", 3: "width"},
-                "hidden": {0: "batch", 2: "height", 3: "width"},
-            },
-        )
-        print(f"Exported ONNX: {path}")
 
 
 # ============================================================================
@@ -861,7 +839,6 @@ def main():
     parser.add_argument("--multi-gpu", action="store_true", help="Use DataParallel across all GPUs")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--export-onnx", action="store_true")
     parser.add_argument("--d-every", type=int, default=1, help="Train D every N steps (1=every step)")
     parser.add_argument("--resume-conv", type=Path, default=None,
                         help="Load conv encoder/decoder weights from a pretrained checkpoint (for MoE upgrade)")
@@ -963,8 +940,6 @@ def main():
         total_epochs_done += phase_epochs
 
     trainer.save(args.output)
-    if args.export_onnx:
-        trainer.export_onnx(args.output / "prism_decoder.onnx")
     print("Done!")
 
 
